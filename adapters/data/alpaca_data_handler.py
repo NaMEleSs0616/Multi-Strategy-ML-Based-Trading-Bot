@@ -1,18 +1,21 @@
 """
-Alpaca historical data handler (minimal; requires API keys).
+Alpaca historical data handler (SQLite cache + Alpaca Market Data API).
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import pandas as pd
 
+from config.settings_store import PROJECT_ROOT
 from core.interfaces import AbstractDataHandler, BarQuery, FeatureRequest, SyncReport
 from data.features.pit_features import build_pit_feature_frame
+from data.harvester.alpaca_loader import fetch_alpaca_bars
+from data.harvester.storage import BarStore
 
 logger = logging.getLogger(__name__)
 
@@ -24,66 +27,65 @@ def _alpaca_keys_present() -> bool:
 
 
 class AlpacaDataHandler(AbstractDataHandler):
-    """
-    Stub/minimal Alpaca historical bars when credentials are configured.
+    """OHLCV + PiT features via SQLite cache and Alpaca fallback."""
 
-    Falls back to empty frames when keys are missing (callers should prefer
-  ``YFinanceDataHandler`` via the factory).
-    """
-
-    def __init__(self, settings: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        settings: dict[str, Any],
+        *,
+        db_path: Optional[Path] = None,
+    ) -> None:
         self._settings = settings
+        data_cfg = settings.get("data", {})
+        self._db_path = db_path or (PROJECT_ROOT / data_cfg.get("sqlite_path", "data/storage/market_data.db"))
+        self._store = BarStore(self._db_path)
+        self._period = data_cfg.get("yfinance_period", "2y")
+        self._intraday_period = data_cfg.get("intraday_period", "60d")
         self._feat_cfg = settings.get("features", {})
         self._available = _alpaca_keys_present()
         if not self._available:
             logger.info("Alpaca API keys not set — AlpacaDataHandler will return empty bars")
 
+    def _period_for_interval(self, interval: str) -> str:
+        if interval in {"1d", "1wk"}:
+            return str(self._period)
+        return str(self._intraday_period)
+
     def fetch_bars(self, query: BarQuery) -> pd.DataFrame:
         if not self._available:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
-        try:
-            from alpaca.data.historical import StockHistoricalDataClient
-            from alpaca.data.requests import StockBarsRequest
-            from alpaca.data.timeframe import TimeFrame
-        except ImportError:
-            logger.warning("alpaca-py not installed")
-            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        bars = self._store.load_bars(query.symbol, query.interval)
+        if len(bars) >= 30 and query.start is None and query.period is None:
+            return bars
 
-        api_key = os.environ.get("APCA_API_KEY_ID") or os.environ.get("ALPACA_API_KEY")
-        secret = os.environ.get("APCA_API_SECRET_KEY") or os.environ.get("ALPACA_SECRET_KEY")
-        client = StockHistoricalDataClient(api_key, secret)
-
-        tf_map = {"1d": TimeFrame.Day, "1h": TimeFrame.Hour, "15m": TimeFrame.Minute15}
-        timeframe = tf_map.get(query.interval, TimeFrame.Day)
-
-        req = StockBarsRequest(
-            symbol_or_symbols=query.symbol,
-            timeframe=timeframe,
+        period = query.period or self._period_for_interval(query.interval)
+        fetched = fetch_alpaca_bars(
+            query.symbol,
+            interval=query.interval,
+            period=None if query.start else period,
             start=query.start,
             end=query.end,
         )
-        bars = client.get_stock_bars(req).df
-        if bars.empty:
-            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-
-        if isinstance(bars.index, pd.MultiIndex):
-            bars = bars.xs(query.symbol, level=0)
-        bars = bars.rename(columns=str.lower)
-        out = bars[["open", "high", "low", "close", "volume"]].copy()
-        out.index = pd.to_datetime(out.index)
-        if out.index.tz is not None:
-            out.index = out.index.tz_localize(None)
-        return out.sort_index()
+        if not fetched.empty:
+            self._store.upsert_bars(query.symbol, query.interval, fetched)
+        return fetched if not fetched.empty else bars
 
     def fetch_feature_frame(self, request: FeatureRequest) -> pd.DataFrame:
         if not request.symbols:
             raise ValueError("FeatureRequest.symbols must be non-empty")
+
+        primary = str(request.symbols[0])
         bars = self.fetch_bars(
-            BarQuery(symbol=str(request.symbols[0]), interval=request.daily_interval)
+            BarQuery(
+                symbol=primary,
+                interval=request.daily_interval,
+                period=self._settings.get("xlstm", {}).get("yfinance_period", self._period),
+            )
         )
         if bars.empty:
             raise RuntimeError("Alpaca returned no bars — check API keys or use yfinance provider")
+
         return build_pit_feature_frame(
             bars,
             pit_shift=int(request.pit_shift),
@@ -91,13 +93,24 @@ class AlpacaDataHandler(AbstractDataHandler):
             atr_window=int(self._feat_cfg.get("atr_window", 14)),
             frac_diff_d=float(self._feat_cfg.get("frac_diff_d", 0.4)),
             frac_diff_thresh=float(self._feat_cfg.get("frac_diff_thresh", 1e-3)),
-        )
+        ).dropna(how="any")
 
     def sync_universe(self, symbols: Sequence[str], intervals: Sequence[str]) -> SyncReport:
         entries: list[dict[str, Any]] = []
         for symbol in symbols:
             for interval in intervals:
-                bars = self.fetch_bars(BarQuery(symbol=symbol, interval=interval))
-                if not bars.empty:
-                    entries.append({"symbol": symbol, "interval": interval, "rows": len(bars)})
+                period = self._period_for_interval(interval)
+                try:
+                    bars = fetch_alpaca_bars(symbol, interval=interval, period=period)
+                except Exception:
+                    logger.exception("Alpaca sync failed for %s %s", symbol, interval)
+                    continue
+                if bars.empty:
+                    continue
+                rows = self._store.upsert_bars(symbol, interval, bars)
+                entries.append({"symbol": symbol, "interval": interval, "rows": rows})
         return SyncReport(entries=entries)
+
+    @property
+    def store(self) -> BarStore:
+        return self._store

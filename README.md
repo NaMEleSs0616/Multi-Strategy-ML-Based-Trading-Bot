@@ -306,6 +306,9 @@ All scripts add the repo root to `sys.path` automatically.
 | `run_paper_loop.py` | `python scripts/run_paper_loop.py` | `--equal-weight`; `--symbol SPY` — dry run only |
 | `run_dashboard.sh` | `./scripts/run_dashboard.sh` | Activates `.venv` if present; runs Streamlit |
 | `run_orchestrator.py` | `python scripts/run_orchestrator.py` | Full 3-stage Global-to-Local pipeline; see flags below |
+| `run_training_monitor.sh` | `./scripts/run_training_monitor.sh` | Live Streamlit monitor for bars, features, strategy returns, training curves |
+
+**Training monitor:** open http://localhost:8501 while training runs — auto-refreshes every 10s (bars inventory, PiT features, strategy returns, xLSTM/PPO curves, checkpoint mtimes).
 
 **`run_orchestrator.py` flags:**
 
