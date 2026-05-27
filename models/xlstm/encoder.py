@@ -82,8 +82,13 @@ class XLSTMStateEncoder(nn.Module):
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Deterministic embedding for inference / RL observations."""
+        was_training = self.training
         self.eval()
-        embedding, _, _ = self.forward(x, return_prediction=False)
+        try:
+            embedding, _, _ = self.forward(x, return_prediction=False)
+        finally:
+            if was_training:
+                self.train()
         return embedding
 
     @torch.no_grad()
@@ -136,6 +141,11 @@ class XLSTMStateEncoder(nn.Module):
         config = XLSTMConfig.from_dict(payload["config"])
         model = cls(config)
         model.load_state_dict(payload["state_dict"])
+        # `map_location` only affects where `torch.load` puts raw tensors; the
+        # freshly constructed `model` is still on CPU. Move it onto the target
+        # device so callers don't hit cross-device runtime errors on the first
+        # forward pass.
+        model.to(torch.device(map_location) if isinstance(map_location, str) else map_location)
         if payload.get("frozen") or freeze:
             freeze_encoder(model)
         return model

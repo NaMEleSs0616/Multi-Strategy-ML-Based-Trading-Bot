@@ -82,6 +82,11 @@ DEFAULTS: dict[str, Any] = {
         "batch_size": 64,
         "checkpoint_dir": "models/ppo/checkpoints",
     },
+    "orchestrator": {
+        "finetune_epochs": 20,
+        "finetune_steps_per_epoch": 1024,
+        "finetune_lr": 0.001,
+    },
     "walk_forward": {
         "n_splits": 5,
         "min_train_size": 252,

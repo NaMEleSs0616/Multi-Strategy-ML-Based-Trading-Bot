@@ -74,6 +74,12 @@ rl:
   turnover_penalty_lambda: 0.1
   purge_embargo_bars: 5
 
+# Global-to-Local orchestrator (scripts/run_orchestrator.py)
+orchestrator:
+  finetune_epochs: 20
+  finetune_steps_per_epoch: 1024
+  finetune_lr: 0.001
+
 # Walk-forward validation
 walk_forward:
   n_splits: 5

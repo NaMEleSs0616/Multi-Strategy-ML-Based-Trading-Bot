@@ -114,8 +114,9 @@ def _ou_penalty_from_sequence(
     # AR(1) coefficient φ per (batch, dim): Cov(z_t, z_{t-1}) / Var(z_{t-1})
     cross = (z_lag * z_cur).sum(dim=1)
     var_lag = z_lag.pow(2).sum(dim=1) + eps
-    phi = cross / var_lag
-    phi = torch.clamp(phi, min=-phi_cap, max=phi_cap)
+    phi_raw = cross / var_lag
+    # Smoothly bound φ into (-phi_cap, phi_cap) while preserving gradient everywhere.
+    phi = phi_cap * torch.tanh(phi_raw / phi_cap)
 
     # Innovation residuals ε_t = (z_t - μ) - φ (z_{t-1} - μ)
     residual = z_cur - phi.unsqueeze(1) * z_lag
@@ -125,17 +126,34 @@ def _ou_penalty_from_sequence(
     var_emp = z.var(dim=1, unbiased=False) + eps
     var_ou = sigma_eps_sq / (1.0 - phi.pow(2) + eps)
 
-    # Variance scaling violation
-    var_mismatch = (var_emp - var_ou).pow(2).mean()
+    # Innovation variance consistency:
+    # For stationary AR(1), sigma_eps^2 should satisfy Var(z) = sigma_eps^2 / (1 - phi^2),
+    # i.e. sigma_eps^2 ≈ Var(z) * (1 - phi^2).
+    sigma_theory = var_emp * (1.0 - phi.pow(2)).clamp_min(eps)
+    log_ratio = torch.log(sigma_eps_sq.clamp_min(eps)) - torch.log(sigma_theory.clamp_min(eps))
+    var_mismatch = log_ratio.pow(2).mean()
+
+    # Variance-growth penalty (regime-level):
+    # Compare average energy in the second half vs the first half of the sequence.
+    # Bounded oscillations stay roughly flat; random walks show strong growth.
+    energy = z.pow(2).mean(dim=2)  # (batch, time)
+    mid = max(1, time // 2)
+    e1 = energy[:, :mid].mean(dim=1)
+    e2 = energy[:, mid:].mean(dim=1)
+    variance_growth = F.relu(e2 - e1).mean()
 
     # Soft stationarity guard: penalize |φ| too close to 1
-    stationarity_violation = F.relu(phi.abs() - phi_cap).pow(2).mean()
+    stationarity_violation = F.relu(phi_raw.abs() - phi_cap).pow(2).mean()
 
-    # Continuous-time θ = (1 - φ) / dt; penalize non-positive θ (non mean-reverting)
-    theta = (1.0 - phi) / dt
-    theta_violation = F.relu(-theta + eps).pow(2).mean()
+    # Continuous-time θ = (1 - φ) / dt; penalize non-positive θ (non mean-reverting).
+    # Use the *unbounded* AR(1) estimate so the term has gradient signal — the smooth
+    # bound on φ makes (1 - φ) always positive, which would otherwise zero this out.
+    theta_raw = (1.0 - phi_raw) / dt
+    theta_violation = F.relu(-theta_raw).pow(2).mean()
 
-    loss_ou = var_mismatch + stationarity_violation + theta_violation
+    # The innovation-consistency term is useful but can dominate for smooth bounded oscillations
+    # (low-noise, non-OU trajectories). Keep it, but at a lower weight for stability.
+    loss_ou = 0.1 * var_mismatch + 2.0 * variance_growth + stationarity_violation + theta_violation
 
     return (
         loss_ou,
@@ -163,8 +181,14 @@ def ou_sde_penalty(
     if cfg.use_hidden_states and hidden_states is not None and hidden_states.dim() == 3:
         sequence = hidden_states
     else:
-        # Fallback: treat batch as a 2-step sequence [z_{t-1}, z_t] for minimal OU check
-        sequence = torch.stack([embedding, embedding], dim=1)
+        # No meaningful OU constraint without a time sequence.
+        zero = embedding.new_zeros(())
+        aux = {
+            "phi_mean": zero.detach(),
+            "var_empirical": zero.detach(),
+            "var_ou_theory": zero.detach(),
+        }
+        return zero, aux
 
     loss_ou, phi_mean, var_emp, var_ou = _ou_penalty_from_sequence(
         sequence,
