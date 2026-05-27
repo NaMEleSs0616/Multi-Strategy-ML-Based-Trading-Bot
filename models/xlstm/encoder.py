@@ -140,7 +140,36 @@ class XLSTMStateEncoder(nn.Module):
         payload = torch.load(path, map_location=map_location, weights_only=False)
         config = XLSTMConfig.from_dict(payload["config"])
         model = cls(config)
-        model.load_state_dict(payload["state_dict"])
+        state_dict: dict[str, torch.Tensor] = payload["state_dict"]
+
+        # Backward compatibility for older checkpoints:
+        # `MLSTMCell.i_proj` / `f_proj` used to be Linear(hidden->hidden) and
+        # later changed to Linear(hidden->1). Convert those weights on load so
+        # older `xlstm_frozen.pt` remains usable.
+        model_sd = model.state_dict()
+        for k, v in list(state_dict.items()):
+            if k not in model_sd:
+                continue
+            if v.shape == model_sd[k].shape:
+                continue
+
+            # i_proj/f_proj weight reshape: (H, H) -> (1, H) by averaging rows.
+            if k.endswith("cell.i_proj.weight") or k.endswith("cell.f_proj.weight"):
+                exp = model_sd[k]
+                if v.ndim == 2 and exp.ndim == 2 and exp.shape[0] == 1 and v.shape[1] == exp.shape[1]:
+                    state_dict[k] = v.mean(dim=0, keepdim=True)
+                    continue
+
+            # i_proj/f_proj bias reshape: (H,) -> (1,) by averaging.
+            if k.endswith("cell.i_proj.bias") or k.endswith("cell.f_proj.bias"):
+                exp = model_sd[k]
+                if v.ndim == 1 and exp.ndim == 1 and exp.shape[0] == 1:
+                    state_dict[k] = v.mean().view(1)
+                    continue
+
+        # Load with strict=False to tolerate missing bias keys from older checkpoints.
+        model.load_state_dict(state_dict, strict=False)
+
         # `map_location` only affects where `torch.load` puts raw tensors; the
         # freshly constructed `model` is still on CPU. Move it onto the target
         # device so callers don't hit cross-device runtime errors on the first
