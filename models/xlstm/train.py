@@ -50,13 +50,16 @@ class PlateauStopper:
 
 def _synthetic_bars(n: int = 2000, seed: int = 42) -> np.ndarray:
     rng = np.random.default_rng(seed)
-    idx = np.arange(n)
-    close = 100.0 + np.cumsum(rng.normal(0, 1.0, n))
+    # Use a strictly-positive price process so PiT features that use `log(...)`
+    # (e.g. log returns / log close) never generate NaNs during offline runs.
+    # Geometric random walk in log-space.
+    log_ret = rng.normal(0.0, 0.01, n)
+    close = 100.0 * np.exp(np.cumsum(log_ret))
     return np.column_stack(
         [
-            close + rng.normal(0, 0.1, n),
-            close + rng.uniform(0.05, 0.5, n),
-            close - rng.uniform(0.05, 0.5, n),
+            close * (1.0 + rng.normal(0.0, 0.001, n)),
+            close * (1.0 + rng.uniform(0.0005, 0.005, n)),
+            close * (1.0 - rng.uniform(0.0005, 0.005, n)),
             close,
             rng.integers(1_000_000, 5_000_000, n),
         ]
