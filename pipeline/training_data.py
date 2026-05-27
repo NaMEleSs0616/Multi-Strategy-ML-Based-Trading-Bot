@@ -51,11 +51,7 @@ def align_to_feature_index(
 
     return TrainingData(
         embeddings=embeddings[feat_rows].astype(np.float64),
-        strategy_returns=StrategyReturns(
-            stat_arb=bundle.strategy_returns.stat_arb[master_rows],
-            vol_breakout=bundle.strategy_returns.vol_breakout[master_rows],
-            mean_reversion=bundle.strategy_returns.mean_reversion[master_rows],
-        ),
+        strategy_returns=bundle.strategy_returns.slice(np.asarray(master_rows)),
         spy_returns=bundle.spy_returns[master_rows].astype(np.float64),
         index=feat_index[feat_rows],
         features=features[feat_rows],

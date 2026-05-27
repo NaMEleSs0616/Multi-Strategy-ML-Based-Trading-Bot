@@ -2,8 +2,35 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional
+
 import numpy as np
 import pandas as pd
+
+
+@dataclass(frozen=True)
+class DailyStrategyConfig:
+    """Optional shared config surface for daily strategies."""
+
+    pit_shift_bars: int = 1
+
+
+class DailyStrategy(ABC):
+    """
+    Minimal daily-strategy base class.
+
+    Existing strategies in this repo are function-based; this class exists
+    to support new strategy *classes* without changing legacy code.
+    """
+
+    def __init__(self, config: Optional[DailyStrategyConfig] = None) -> None:
+        self.config = config or DailyStrategyConfig()
+
+    @abstractmethod
+    def returns(self) -> pd.Series:
+        """Return daily strategy returns as a ``pd.Series`` indexed by date."""
 
 
 def pit_shift(series: pd.Series, bars: int = 1) -> pd.Series:

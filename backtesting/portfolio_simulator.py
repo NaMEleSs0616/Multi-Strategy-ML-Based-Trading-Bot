@@ -82,11 +82,11 @@ def simulate_routed_portfolio(
     spy_returns = pd.Series(spy, index=index, name="spy")
     excess_returns = portfolio_returns - spy_returns
     turnover_s = pd.Series(turnovers, index=index, name="turnover")
-    weights = pd.DataFrame(
-        weights_hist,
-        index=index,
-        columns=["stat_arb", "vol_breakout", "mean_reversion"],
-    )
+    leg_names = data.strategy_returns.names()
+    columns = list(leg_names) if len(leg_names) == n_strategies else [
+        f"leg_{i}" for i in range(n_strategies)
+    ]
+    weights = pd.DataFrame(weights_hist, index=index, columns=columns)
     equity = (1.0 + portfolio_returns).cumprod()
     metrics = summarize_backtest(portfolio_returns, spy_returns, turnover_s)
 

@@ -1,6 +1,6 @@
 # Multi-Strategy RL Trading Bot
 
-A **Global-to-Local** two-stage ML stack plus per-ticker policy adaptation: a frozen xLSTM market-state encoder, a walk-forward PPO capital router, and optional async micro-fine-tuning of only the final routing layer. Risk is sized with fractional Kelly; execution uses passive limit orders in simulation. The design goal is to beat SPY on a risk-adjusted basis (Information Ratio), using free or cached OHLCV where possible.
+A **Global-to-Local** stack with modular data/execution adapters: a frozen xLSTM market-state encoder, a walk-forward PPO capital router over a multi-leg strategy bank, and optional async per-ticker policy adaptation. Risk is sized with fractional Kelly plus live/paper diversification caps; execution uses passive limit orders. The design goal is to beat SPY out-of-sample on risk-adjusted returns while preserving strict point-in-time (PiT) data discipline.
 
 ## Architecture
 
@@ -40,14 +40,14 @@ flowchart TB
 
 | Stage | Role | Main code | Checkpoint |
 |-------|------|-----------|------------|
-| **1 — Global** | Self-supervised xLSTM on PiT features (MSE + OU SDE penalty); plateau → freeze | `models/xlstm/`, `pipeline/train_orchestrator.py` | `global_xlstm_weights.pt` |
-| **2 — Base PPO** | PPO allocates weights across three strategies on **purged walk-forward** folds | `models/ppo/`, `rl/gym_trading_env.py` | `base_ppo_router.zip` |
+| **1 — Global** | Self-supervised xLSTM on PiT features (MSE + OU SDE penalty); plateau → freeze | `models/xlstm/`, `pipeline/train_orchestrator.py` | `xlstm_frozen.pt` |
+| **2 — Base PPO** | PPO allocates weights across the strategy bank on **purged walk-forward** folds | `models/ppo/`, `rl/gym_trading_env.py` | `ppo_router.zip` |
 | **3 — Local** | Async per-ticker micro-train: xLSTM frozen; **only** `action_net` + `log_std` unfrozen | `pipeline/train_orchestrator.py` | `{TICKER}_active_policy.pt` |
-| Bank | Daily stat-arb, vol breakout (15m→daily), mean reversion (5m→daily) | `strategies/` | — |
-| Risk | Half-Kelly (configurable) on recent strategy returns | `core/risk_manager.py` | — |
+| Bank | 9 legs: classic + daily macro-beta + advanced stat-vol overlays | `strategies/` | — |
+| Risk | Fractional Kelly + momentum boost + live/paper max-single-weight cap | `core/risk_manager.py` | — |
 | Execution | Passive limit fills in backtest; Alpaca limits when configured | `adapters/execution/` | — |
 
-**Objective:** maximize Information Ratio vs SPY with turnover and transaction-cost penalties aligned between the Gym env and the event-driven backtester.
+**Objective:** maximize robust out-of-sample routing quality vs SPY with asymmetric downside-aware reward shaping and realistic turnover/cost penalties.
 
 **Stage handoff invariants** (enforced in `train_orchestrator.py`):
 
@@ -98,11 +98,9 @@ Multi-Strategy ML based trading bot/
 | Path | Description |
 |------|-------------|
 | `data/storage/market_data.db` | SQLite OHLCV |
-| `models/xlstm/checkpoints/` | `xlstm_best.pt`, `xlstm_frozen.pt`, `embeddings.npy` (CLI training) |
-| `models/ppo/checkpoints/` | `ppo_router.zip`, `train_summary.json` (CLI training) |
-| `{out_dir}/global_xlstm_weights.pt` | Orchestrator Stage 1 frozen encoder |
-| `{out_dir}/base_ppo_router.zip` | Orchestrator Stage 2 base policy |
-| `{out_dir}/ticker_policies/{TICKER}_active_policy.pt` | Stage 3 delta (`action_net` + `log_std` only) |
+| `models/checkpoints/` | Unified artifact root (`xlstm_best.pt`, `xlstm_frozen.pt`, `embeddings.npy`, `ppo_router.zip`, `ppo_train_summary.json`) |
+| `models/checkpoints/ticker_policies/{TICKER}_active_policy.pt` | Stage 3 per-ticker delta (`action_net` + `log_std` only) |
+| `{out_dir}/...` | Optional override via `--out-dir` on train/orchestrator CLIs |
 | `backtesting/reports/` | Backtest / walk-forward / paper-loop JSON |
 
 ## Prerequisites and install
@@ -129,12 +127,12 @@ Primary file: [`config/settings.yaml`](config/settings.yaml). The Streamlit dash
 |---------|---------|
 | `universe` | Equity and ETF tickers for harvest and features |
 | `data` | Provider (`yfinance` \| `alpaca`), SQLite path, intervals, lookback periods |
-| `strategies` | Pair for stat-arb, z/ATR/RSI windows, `transaction_cost_bps`, `dynamic_pair_selection` |
+| `strategies` | Pair for stat-arb, intraday windows, daily/macro overlays, advanced leg toggles |
 | `features` | `frac_diff_d`, PiT `pit_shift`, optional `include_macro` / `include_sentiment` |
 | `xlstm` | Architecture, training schedule, OU hyperparameters (`ou_gamma`, `ou_dt`), checkpoints |
 | `ppo` | Stable-Baselines3 PPO hyperparameters and checkpoint dir |
-| `risk` | Kelly overlay: `enabled`, `kelly_window`, `kelly_fraction` |
-| `rl` | Embedding dim, strategy count, turnover penalty, purge embargo bars |
+| `risk` | Kelly overlay + momentum boost + `max_single_weight_live` cap |
+| `rl` | Embedding dim, strategy count, reward weights, bps turnover penalty, purge embargo bars |
 | `walk_forward` | Fold count, train/test sizes, smoke timesteps for dashboard |
 | `orchestrator` | Stage 3 fine-tune: `finetune_epochs`, `finetune_steps_per_epoch`, `finetune_lr` |
 | `execution` | `mode` (`backtest` \| `alpaca`), paper flag, limit-order latency/spread |
@@ -298,14 +296,14 @@ All scripts add the repo root to `sys.path` automatically.
 
 | Script | Command | Flags / notes |
 |--------|---------|----------------|
-| `sync_data.py` | `python scripts/sync_data.py` | Downloads universe OHLCV into `data/storage/market_data.db` (yfinance) |
-| `train_xlstm.py` | `python scripts/train_xlstm.py` | `--no-yfinance` synthetic bars; `--device cpu\|cuda\|mps` |
-| `train_ppo.py` | `python scripts/train_ppo.py` | `--require-encoder` fail without xLSTM checkpoint; `--fold N` train one fold only |
+| `sync_data.py` | `python scripts/sync_data.py` | Syncs via configured provider (`data.provider`), writes to SQLite |
+| `train_xlstm.py` | `python scripts/train_xlstm.py` | `--no-yfinance`; `--device cpu\|cuda\|mps`; `--out-dir` |
+| `train_ppo.py` | `python scripts/train_ppo.py` | `--require-encoder`; `--fold N`; `--out-dir` |
 | `run_backtest.py` | `python scripts/run_backtest.py` | `--equal-weight` 1/3 each; `--execution` SPY limit simulation |
 | `run_walk_forward_report.py` | `python scripts/run_walk_forward_report.py` | `--equal-weight`, `--no-csv`, `--require-encoder` |
 | `run_paper_loop.py` | `python scripts/run_paper_loop.py` | `--equal-weight`; `--symbol SPY` — dry run only |
 | `run_dashboard.sh` | `./scripts/run_dashboard.sh` | Activates `.venv` if present; runs Streamlit |
-| `run_orchestrator.py` | `python scripts/run_orchestrator.py` | Full 3-stage Global-to-Local pipeline; see flags below |
+| `run_orchestrator.py` | `python scripts/run_orchestrator.py` | Full 3-stage pipeline; defaults to unified artifact root |
 | `run_training_monitor.sh` | `./scripts/run_training_monitor.sh` | Live Streamlit monitor for bars, features, strategy returns, training curves |
 
 **Training monitor:** open http://localhost:8501 while training runs — auto-refreshes every 10s (bars inventory, PiT features, strategy returns, xLSTM/PPO curves, checkpoint mtimes).
@@ -314,7 +312,7 @@ All scripts add the repo root to `sys.path` automatically.
 
 | Flag | Purpose |
 |------|---------|
-| `--out-dir` | Default `models/orchestrator/` (`global_xlstm_weights.pt`, `base_ppo_router.zip`, `ticker_policies/`) |
+| `--out-dir` | Default `artifacts.root_dir` from settings (shared with train_xlstm/train_ppo) |
 | `--tickers NVDA AMD` | Stage 3 fine-tune list (default: `universe.equities`) |
 | `--global-symbol NVDA` | Primary symbol for Stage 1/2 (default: first equity) |
 | `--no-yfinance` | Synthetic global features (offline smoke); sync SQLite for real strategy bank |
@@ -344,7 +342,7 @@ python scripts/sync_data.py
 python scripts/run_orchestrator.py -v --global-symbol NVDA --tickers NVDA AMD META GOOGL MSFT
 ```
 
-**Intraday limit:** yfinance caps 5m/15m history (~60 days). Daily features and stat-arb can use 5y; vol-breakout and mean-reversion legs use shorter intraday windows unless you add Alpaca historical or another source.
+**Intraday limit:** yfinance caps 5m/15m history (~60 days). Alpaca sync path now supports robust chunked/paginated historical backfills into SQLite for longer intraday history.
 
 Module smoke tests:
 
@@ -357,11 +355,17 @@ python -m rl.gym_trading_env
 
 | Leg | Timeframe | Model |
 |-----|-----------|--------|
-| Stat-arb | Daily | Cointegration spread on configured pair (default NVDA/AMD); optional `dynamic_pair_selection` |
+| Stat-arb | Daily | Cointegration spread on configured pair (optional `dynamic_pair_selection`) |
 | Vol breakout | 15m → daily | ATR channel breakout |
 | Mean reversion | 5m → daily | RSI + Bollinger |
+| Daily momentum | Daily | SMA crossover (beta capture) |
+| Daily trend | Daily | Long-only SMA trend filter |
+| VIX fade | Daily macro | Panic-subsiding long signal (FRED VIX) |
+| Cross-sectional momentum | Daily | Relative ROC vs SPY |
+| Fractional stat-arb | Daily | Long-memory spread MR (fractional d filter) |
+| VRP harvesting | Daily macro | IV-RV z-score fade on benchmark |
 
-Returns are aligned to a master daily index in `strategies/bank.py` for RL and backtests.
+Returns are aligned to a master daily index in `strategies/bank.py` and surfaced through `StrategyReturns` (dynamic leg count), so PPO action space scales automatically with enabled legs.
 
 ## xLSTM and OU loss (math layer)
 
@@ -472,7 +476,7 @@ Coverage highlights: fracdiff, adapters, Kelly, OU loss (`tests/test_custom_loss
 ## Foundation modules
 
 - [`backtesting/event_driven_backtester.py`](backtesting/event_driven_backtester.py) — bar-by-bar event queue, limit fills, look-ahead audit
-- [`rl/gym_trading_env.py`](rl/gym_trading_env.py) — PPO routing environment, cost-aware reward, purged walk-forward splits
+- [`rl/gym_trading_env.py`](rl/gym_trading_env.py) — PPO routing environment, asymmetric downside-aware reward, thresholded turnover penalty, purged walk-forward splits
 - [`models/xlstm/`](models/xlstm/) — sLSTM + mLSTM blocks, OU-informed pretraining, freeze for RL
 - [`pipeline/train_orchestrator.py`](pipeline/train_orchestrator.py) — Global-to-Local three-stage training + async Stage 3 queue
 - [`pipeline/orchestrator_provider.py`](pipeline/orchestrator_provider.py) — `SettingsFeatureProvider` for `run_orchestrator.py`
@@ -486,7 +490,7 @@ Coverage highlights: fracdiff, adapters, Kelly, OU loss (`tests/test_custom_loss
 | Continuous live paper trading loop | `run_paper_loop.py` is a single dry-run rebalance via `BacktestExecutionHandler`, not a scheduled live service |
 | Custom `FeatureProvider` | Implement protocols in `pipeline.train_orchestrator` instead of `SettingsFeatureProvider` |
 | Stage 3 hot-load at inference | `{TICKER}_active_policy.pt` stores `action_net` + `log_std` deltas; merge onto `base_ppo_router.zip` in your execution layer |
-| Alpaca historical data handler | Minimal stub when keys are set; factory falls back to yfinance if keys are absent |
+| Alpaca historical data handler | Fully wired with chunked intraday backfill + SQLite upsert; factory falls back to yfinance only when keys are absent |
 | Real-time SIP/IEX bar subscription | Not wired |
 
 To experiment with Alpaca later: set keys, set `data.provider: alpaca` and/or `execution.mode: alpaca` with `execution.paper: true`, and implement WebSocket persistence in `alpaca_stream.py` calling `BarStore.upsert_bars`.

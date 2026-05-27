@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from config.settings_store import PROJECT_ROOT, load_settings
+from core.paths import ArtifactPaths
 from pipeline.training_data import build_training_data
 from rl.gym_trading_env import TradingRoutingEnv
 from rl.validation.purge import PurgedWalkForwardSplitter
@@ -28,6 +29,7 @@ def train_ppo_router(
     *,
     require_encoder: bool = False,
     fold_id: Optional[int] = None,
+    out_dir: Optional[Path] = None,
 ) -> PPORouterResult:
     try:
         from stable_baselines3 import PPO
@@ -67,8 +69,10 @@ def train_ppo_router(
         if not folds:
             raise ValueError(f"fold_id {fold_id} not found")
 
-    ckpt_dir = PROJECT_ROOT / ppo_cfg.get("checkpoint_dir", "models/ppo/checkpoints")
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    paths = ArtifactPaths.from_settings(settings)
+    if out_dir is not None:
+        paths = ArtifactPaths(root=Path(out_dir), ticker_policies_subdir=paths.ticker_policies_subdir)
+    paths.ensure_dirs()
     summary: list[dict[str, Any]] = []
 
     model = None
@@ -80,6 +84,12 @@ def train_ppo_router(
                 data.spy_returns,
                 walk_forward_fold=fold,
                 turnover_penalty_lambda=float(rl_cfg["turnover_penalty_lambda"]),
+                turnover_penalty_multiplier=float(
+                    rl_cfg.get("turnover_penalty_multiplier", 1.0)
+                ),
+                sortino_weight=float(rl_cfg.get("sortino_weight", 0.5)),
+                outperformance_weight=float(rl_cfg.get("outperformance_weight", 0.5)),
+                sortino_window=int(rl_cfg.get("sortino_window", 30)),
                 purge_embargo=int(rl_cfg["purge_embargo_bars"]),
                 settings=settings,
             )
@@ -109,10 +119,10 @@ def train_ppo_router(
         )
 
     assert model is not None
-    model_path = ckpt_dir / "ppo_router.zip"
+    model_path = paths.ppo_router
     model.save(str(model_path))
 
-    summary_path = ckpt_dir / "train_summary.json"
+    summary_path = paths.ppo_summary
     with summary_path.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
 

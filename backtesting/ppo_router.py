@@ -8,14 +8,13 @@ from typing import Any, Callable, Optional
 import numpy as np
 
 from config.settings_store import PROJECT_ROOT, load_settings
+from core.paths import ArtifactPaths
 from rl.gym_trading_env import TradingRoutingEnv
 
 
 def resolve_ppo_path(settings: Optional[dict[str, Any]] = None) -> Path:
     settings = settings or load_settings()
-    path = PROJECT_ROOT / settings.get("ppo", {}).get(
-        "checkpoint_dir", "models/ppo/checkpoints"
-    ) / "ppo_router.zip"
+    path = ArtifactPaths.from_settings(settings).ppo_router
     if not path.exists():
         raise FileNotFoundError(f"PPO model not found at {path}. Train with scripts/train_ppo.py")
     return path

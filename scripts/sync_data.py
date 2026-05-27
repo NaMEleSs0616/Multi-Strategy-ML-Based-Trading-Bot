@@ -9,11 +9,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from config.settings_store import load_settings
 from data.harvester.pipeline import sync_universe
 
 
 def main() -> None:
-    results = sync_universe()
+    settings = load_settings()
+    provider = str(settings.get("data", {}).get("provider", "yfinance"))
+    print(f"provider={provider}")
+    results = sync_universe(settings=settings)
     for row in results:
         print(f"{row.symbol:6s} {row.interval:4s}  {row.rows:5d} rows")
     print(f"Done — {len(results)} series synced.")

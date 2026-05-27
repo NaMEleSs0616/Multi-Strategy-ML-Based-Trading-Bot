@@ -4,7 +4,7 @@ universe:
   etfs: [QQQ, SPY, XLK]
 
 data:
-  provider: yfinance  # yfinance | alpaca
+  provider: alpaca  # yfinance | alpaca
   sqlite_path: data/storage/market_data.db
   daily_interval: 1d
   intraday_intervals: [5m, 15m]
@@ -22,6 +22,37 @@ strategies:
   vol_lookback: 20
   mr_rsi_window: 14
   mr_bb_window: 20
+  # Daily momentum (SMA crossover, long/short/flat) — beta-capture leg
+  # added to fix the market-neutral bias and the 60-day intraday blindspot.
+  enable_daily_momentum: true
+  daily_momentum_fast_window: 50
+  daily_momentum_slow_window: 200
+  # Daily trend (SMA crossover, long-only). Complements daily_momentum by
+  # encoding "uptrend or cash" with no short bias.
+  enable_daily_trend: true
+  daily_trend_fast_window: 50
+  daily_trend_slow_window: 200
+  # VIX fade — long on the primary equity when VIX > threshold AND VIX
+  # rate-of-change has turned negative (panic subsiding). Requires
+  # FRED_API_KEY; degrades to a zero-return inert leg without it.
+  enable_vix_fade: true
+  vix_fade_threshold: 25.0
+  vix_fade_roc_lookback: 1
+  # Cross-sectional momentum — long when ticker's 90-day ROC exceeds SPY's.
+  enable_cross_sectional_mom: true
+  cross_sectional_mom_lookback: 90
+  # Fractional cointegration stat-arb (advanced long-memory spread MR)
+  enable_fractional_stat_arb: true
+  fractional_stat_arb_window: 252
+  fractional_stat_arb_entry_z: 2.0
+  fractional_stat_arb_exit_z: 0.5
+  fractional_stat_arb_gph_m: 10
+  fractional_stat_arb_d_max: 0.5
+  # Variance risk premium harvesting (IV - RV) fade on SPY
+  enable_vrp_harvesting: true
+  vrp_rv_window: 30
+  vrp_z_window: 252
+  vrp_z_threshold: 2.0
 
 # PiT feature engineering
 features:
@@ -66,12 +97,33 @@ risk:
   enabled: true
   kelly_window: 30
   kelly_fraction: 0.5
+  # Live/paper diversification cap: prevent any single strategy from cornering capital.
+  max_single_weight_live: 0.60
+  # Anti "Lazy Agent": when a leg's recent win-rate clears the threshold the
+  # fractional Kelly is scaled up by ``momentum_boost`` and floored at
+  # ``min_momentum_allocation``, so trending regimes stop being throttled to cash.
+  min_momentum_allocation: 0.25
+  momentum_win_rate_threshold: 0.55
+  momentum_boost: 1.5
 
 # RL routing
 rl:
   embedding_dim: 64
-  n_strategies: 3
+  n_strategies: 9
+  # Turnover penalty expressed in bps of notional reallocated.
+  # This is intentionally tiny to prevent out-of-sample freezing.
+  # Applied only to per-leg weight changes exceeding 5%.
+  turnover_penalty_bps: 2.0
+  turnover_weight_change_threshold: 0.05
+  # Effective per-step turnover penalty = turnover_penalty_lambda * turnover_penalty_multiplier.
+  # ``turnover_penalty_multiplier`` is a separate dial so operators can dampen
+  # the penalty without changing the trained PPO checkpoint's reward scale.
   turnover_penalty_lambda: 0.1
+  turnover_penalty_multiplier: 0.5
+  # Composite reward = sortino_weight*Sortino + outperformance_weight*(R_p - R_SPY).
+  sortino_weight: 0.5
+  outperformance_weight: 0.5
+  sortino_window: 30
   purge_embargo_bars: 5
 
 # Global-to-Local orchestrator (scripts/run_orchestrator.py)
@@ -89,7 +141,7 @@ walk_forward:
 
 # Execution
 execution:
-  mode: backtest  # backtest | alpaca
+  mode: alpaca  # backtest | alpaca
   paper: true
   order_type: limit
   latency_bars: 1
@@ -101,6 +153,11 @@ backtest:
   initial_cash: 100000.0
   rebalance_threshold: 0.05
   report_dir: backtesting/reports
+
+# Unified artifact paths (used by CLI scripts AND orchestrator)
+artifacts:
+  root_dir: models/checkpoints
+  ticker_policies_subdir: ticker_policies
 
 # Diagnostics (dashboard / audit harness)
 diagnostics:

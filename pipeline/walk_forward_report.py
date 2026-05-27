@@ -32,11 +32,7 @@ def _slice_training_data(data: TrainingData, indices: np.ndarray) -> TrainingDat
     idx = np.asarray(indices, dtype=np.int64)
     return TrainingData(
         embeddings=data.embeddings[idx],
-        strategy_returns=StrategyReturns(
-            stat_arb=data.strategy_returns.stat_arb[idx],
-            vol_breakout=data.strategy_returns.vol_breakout[idx],
-            mean_reversion=data.strategy_returns.mean_reversion[idx],
-        ),
+        strategy_returns=data.strategy_returns.slice(idx),
         spy_returns=data.spy_returns[idx],
         index=pd.DatetimeIndex(data.index[idx]),
         features=data.features[idx],

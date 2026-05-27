@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.settings_store import load_settings  # noqa: E402
+from core.paths import ArtifactPaths  # noqa: E402
 from pipeline.orchestrator_provider import SettingsFeatureProvider  # noqa: E402
 from pipeline.train_orchestrator import (  # noqa: E402
     Stage1Config,
@@ -61,6 +62,10 @@ def _stage_configs(settings: dict, input_dim: int) -> tuple[Stage1Config, Stage2
         n_steps=int(ppo.get("n_steps", 256)),
         batch_size=int(ppo.get("batch_size", 64)),
         turnover_penalty_lambda=float(rl.get("turnover_penalty_lambda", 0.1)),
+        turnover_penalty_multiplier=float(rl.get("turnover_penalty_multiplier", 1.0)),
+        sortino_weight=float(rl.get("sortino_weight", 0.5)),
+        outperformance_weight=float(rl.get("outperformance_weight", 0.5)),
+        sortino_window=int(rl.get("sortino_window", 30)),
     )
     stage3 = Stage3Config(
         epochs=int(settings.get("orchestrator", {}).get("finetune_epochs", 20)),
@@ -77,8 +82,8 @@ def main() -> None:
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=ROOT / "models" / "orchestrator",
-        help="Output directory for global_xlstm_weights.pt, base_ppo_router.zip, ticker_policies/",
+        default=None,
+        help="Output directory (default: artifacts.root_dir from settings.yaml)",
     )
     parser.add_argument(
         "--tickers",
@@ -119,6 +124,9 @@ def main() -> None:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     settings = load_settings()
+    paths = ArtifactPaths.from_settings(settings)
+    out_dir: Path = args.out_dir or paths.root
+
     provider = SettingsFeatureProvider(
         settings=settings,
         use_yfinance=not args.no_yfinance,
@@ -130,7 +138,7 @@ def main() -> None:
 
     stage1, stage2, stage3 = _stage_configs(settings, provider.input_dim)
 
-    print(f"device={args.device or 'auto'} out_dir={args.out_dir}")
+    print(f"device={args.device or 'auto'} out_dir={out_dir}")
     print(f"global_symbol={provider.primary_symbol} stage3_tickers={tickers}")
     print(f"input_dim={provider.input_dim} embedding_dim={stage1.embedding_dim}")
 
@@ -140,15 +148,15 @@ def main() -> None:
         stage2_config=stage2,
         stage3_config=stage3,
         env_settings=settings,
-        out_dir=args.out_dir,
+        out_dir=out_dir,
         tickers=tickers,
         prefer_device=args.device,
         max_concurrent_ft=args.max_concurrent_ft,
     )
 
     print("\nArtifacts:")
-    print(f"  global encoder: {args.out_dir / 'global_xlstm_weights.pt'}")
-    print(f"  base PPO:       {args.out_dir / 'base_ppo_router.zip'}")
+    print(f"  global encoder: {out_dir / 'xlstm_frozen.pt'}")
+    print(f"  base PPO:       {out_dir / 'ppo_router.zip'}")
     for ticker, path in results.items():
         print(f"  {ticker}: {path}")
 

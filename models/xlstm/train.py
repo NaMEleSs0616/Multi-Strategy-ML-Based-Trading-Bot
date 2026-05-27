@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from config.settings_store import PROJECT_ROOT, load_settings
+from core.paths import ArtifactPaths
 from data.features.pit_features import build_pit_feature_frame, feature_matrix
 from models.xlstm.dataset import NextStepSequenceDataset, train_val_split
 from models.xlstm.custom_loss import XLSTMPretrainingLoss
@@ -131,6 +132,7 @@ def train_xlstm(
     *,
     use_yfinance: bool = True,
     device: Optional[str] = None,
+    out_dir: Optional[Path] = None,
 ) -> TrainResult:
     settings = settings or load_settings()
     xlstm_cfg = settings.get("xlstm", {})
@@ -187,11 +189,13 @@ def train_xlstm(
         min_delta=float(xlstm_cfg.get("plateau_min_delta", 1e-4)),
     )
 
-    ckpt_dir = PROJECT_ROOT / xlstm_cfg.get("checkpoint_dir", "models/xlstm/checkpoints")
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    best_path = ckpt_dir / "xlstm_best.pt"
-    frozen_path = ckpt_dir / "xlstm_frozen.pt"
-    history_path = ckpt_dir / "train_history.json"
+    paths = ArtifactPaths.from_settings(settings)
+    if out_dir is not None:
+        paths = ArtifactPaths(root=Path(out_dir), ticker_policies_subdir=paths.ticker_policies_subdir)
+    paths.ensure_dirs()
+    best_path = paths.xlstm_best
+    frozen_path = paths.xlstm_frozen
+    history_path = paths.xlstm_history
 
     history: list[dict[str, float]] = []
     best_val = float("inf")
@@ -265,7 +269,7 @@ def train_xlstm(
     if bool(xlstm_cfg.get("export_embeddings", True)):
         from models.xlstm.inference import encode_feature_matrix
 
-        embeddings_path = ckpt_dir / "embeddings.npy"
+        embeddings_path = paths.xlstm_embeddings
         with torch.no_grad():
             emb = encode_feature_matrix(model, features, device=device_t)
         np.save(embeddings_path, emb)

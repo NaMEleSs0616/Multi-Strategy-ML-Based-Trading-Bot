@@ -282,6 +282,10 @@ class Stage2Config:
     n_steps: int = 256
     batch_size: int = 64
     turnover_penalty_lambda: float = 1e-4
+    turnover_penalty_multiplier: float = 1.0
+    sortino_weight: float = 0.5
+    outperformance_weight: float = 0.5
+    sortino_window: int = 30
 
 
 def stage_2_train_base_ppo(
@@ -351,6 +355,10 @@ def stage_2_train_base_ppo(
                 bench_ret,
                 walk_forward_fold=_fold,
                 turnover_penalty_lambda=config.turnover_penalty_lambda,
+                turnover_penalty_multiplier=config.turnover_penalty_multiplier,
+                sortino_weight=config.sortino_weight,
+                outperformance_weight=config.outperformance_weight,
+                sortino_window=config.sortino_window,
                 purge_embargo=config.embargo,
                 settings=env_settings,
             )
@@ -731,9 +739,11 @@ async def run_full_orchestration(
     device = select_device(prefer_device)
     LOG.info("[orchestrator] device=%s", device)
 
+    # Canonical filenames are shared with scripts/train_xlstm.py + scripts/train_ppo.py
+    # so Path A (CLI) and Path B (Orchestrator) always read/write the same artifacts.
     out_dir.mkdir(parents=True, exist_ok=True)
-    encoder_path = out_dir / "global_xlstm_weights.pt"
-    base_policy_path = out_dir / "base_ppo_router.zip"
+    encoder_path = out_dir / "xlstm_frozen.pt"
+    base_policy_path = out_dir / "ppo_router.zip"
     ticker_dir = out_dir / "ticker_policies"
     ticker_dir.mkdir(parents=True, exist_ok=True)
 

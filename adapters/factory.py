@@ -43,7 +43,11 @@ def create_execution_handler(
     exec_cfg = settings.get("execution", {})
 
     if mode == "alpaca":
-        return AlpacaExecutionHandler(paper=bool(exec_cfg.get("paper", True)))
+        return AlpacaExecutionHandler(
+            paper=bool(exec_cfg.get("paper", True)),
+            settings=settings,
+            websockets_connected=bool(exec_cfg.get("websockets_connected", False)),
+        )
 
     cash = initial_cash or float(settings.get("backtest", {}).get("initial_cash", 100_000.0))
     return BacktestExecutionHandler(

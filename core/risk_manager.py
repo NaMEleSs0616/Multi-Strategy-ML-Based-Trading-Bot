@@ -20,6 +20,15 @@ class KellyConfig:
     max_kelly: float = 1.0
     eps: float = 1e-8
 
+    # --- Momentum-aware sizing (anti "Lazy Agent" hot-fix) ----------------
+    # When a leg's rolling win-rate clears ``momentum_win_rate_threshold``
+    # the fractional Kelly is multiplied by ``momentum_boost`` and floored
+    # at ``min_momentum_allocation`` so the PPO agent retains real sizing
+    # in clear trending regimes instead of being throttled to cash.
+    min_momentum_allocation: float = 0.0
+    momentum_win_rate_threshold: float = 0.55
+    momentum_boost: float = 1.5
+
 
 class RiskManager:
     """
@@ -30,11 +39,25 @@ class RiskManager:
       K = W - (1 - W) / R
       fractional_kelly = ``fraction`` * K  (default 0.5 * K)
 
+    A momentum-regime override scales ``fractional_kelly`` up (and floors
+    it at ``min_momentum_allocation``) when the leg's recent win-rate
+    exceeds ``momentum_win_rate_threshold``. This prevents the "Lazy
+    Agent" pathology where Kelly throttles the PPO router to cash in
+    obvious trending regimes.
+
     ``apply_kelly_cap`` scales softmax weights down when Kelly is low.
     """
 
     def __init__(self, config: Optional[KellyConfig] = None) -> None:
         self.config = config or KellyConfig()
+
+    @staticmethod
+    def _leg_win_rate(returns: np.ndarray) -> float:
+        r = np.asarray(returns, dtype=np.float64).reshape(-1)
+        nonzero = r[r != 0.0]
+        if nonzero.size == 0:
+            return 0.0
+        return float((nonzero > 0).mean())
 
     @staticmethod
     def _leg_kelly(returns: np.ndarray, *, eps: float) -> float:
@@ -52,6 +75,16 @@ class RiskManager:
         r_ratio = avg_win / max(avg_loss, eps)
         k = w - (1.0 - w) / max(r_ratio, eps)
         return float(k)
+
+    def _momentum_adjusted_fk(self, fk: float, segment: np.ndarray) -> float:
+        """Boost fractional Kelly and apply momentum floor when win-rate is high."""
+        cfg = self.config
+        if cfg.min_momentum_allocation <= 0.0 and cfg.momentum_boost <= 1.0:
+            return fk
+        win_rate = self._leg_win_rate(segment)
+        if win_rate >= cfg.momentum_win_rate_threshold:
+            fk = max(fk * cfg.momentum_boost, cfg.min_momentum_allocation)
+        return fk
 
     def kelly_multipliers(
         self,
@@ -82,6 +115,7 @@ class RiskManager:
             segment = matrix[start:t_end, j]
             k = self._leg_kelly(segment, eps=self.config.eps)
             fk = self.config.fraction * k
+            fk = self._momentum_adjusted_fk(fk, segment)
             fk = float(np.clip(fk, self.config.min_kelly, self.config.max_kelly))
             multipliers[j] = max(0.0, min(1.0, fk))
 
@@ -110,6 +144,56 @@ class RiskManager:
             w = np.ones(n, dtype=np.float64) / n
         return w
 
+    @staticmethod
+    def cap_max_weight(w: np.ndarray, *, max_weight: float, eps: float = 1e-12) -> np.ndarray:
+        """
+        Enforce a hard diversification cap: no single strategy may exceed ``max_weight``.
+
+        The remainder is redistributed proportionally across uncapped weights when possible,
+        otherwise spread evenly across the other legs. Always returns a vector summing to 1.
+        """
+        w = np.asarray(w, dtype=np.float64).reshape(-1).copy()
+        n = w.size
+        if n == 0:
+            return w
+        cap = float(max_weight)
+        if cap <= 0.0:
+            return np.ones(n, dtype=np.float64) / n
+        if cap >= 1.0:
+            total = float(w.sum())
+            return w / total if total > eps else (np.ones(n, dtype=np.float64) / n)
+
+        # Iteratively cap until stable (handles multiple > cap).
+        uncapped = np.ones(n, dtype=bool)
+        w = np.maximum(w, 0.0)
+        while True:
+            over = (w > cap) & uncapped
+            if not bool(np.any(over)):
+                break
+            w[over] = cap
+            uncapped[over] = False
+
+            remaining = 1.0 - float(w[~uncapped].sum())
+            if remaining <= 0.0:
+                # Too many capped weights; renormalize capped mass.
+                total = float(w.sum())
+                return w / total if total > eps else (np.ones(n, dtype=np.float64) / n)
+
+            base = w[uncapped]
+            base_sum = float(base.sum())
+            if base_sum > eps:
+                w[uncapped] = base / base_sum * remaining
+            else:
+                # No positive uncapped weights: distribute remainder equally.
+                k = int(np.sum(uncapped))
+                if k == 0:
+                    total = float(w.sum())
+                    return w / total if total > eps else (np.ones(n, dtype=np.float64) / n)
+                w[uncapped] = remaining / k
+
+        total = float(w.sum())
+        return w / total if total > eps else (np.ones(n, dtype=np.float64) / n)
+
 
 def apply_kelly_from_settings(
     weights: np.ndarray,
@@ -126,6 +210,21 @@ def apply_kelly_from_settings(
         KellyConfig(
             window=int(risk_cfg.get("kelly_window", 30)),
             fraction=float(risk_cfg.get("kelly_fraction", 0.5)),
+            min_momentum_allocation=float(
+                risk_cfg.get("min_momentum_allocation", 0.0)
+            ),
+            momentum_win_rate_threshold=float(
+                risk_cfg.get("momentum_win_rate_threshold", 0.55)
+            ),
+            momentum_boost=float(risk_cfg.get("momentum_boost", 1.5)),
         )
     )
-    return rm.apply_kelly_cap(weights, strategy_matrix, end_index=bar_index)
+    w = rm.apply_kelly_cap(weights, strategy_matrix, end_index=bar_index)
+
+    # Live/paper-only diversification floor: prevent 100% cornering into a single leg.
+    exec_cfg = settings.get("execution", {}) or {}
+    if str(exec_cfg.get("mode", "backtest")).lower() == "alpaca" and bool(exec_cfg.get("paper", True)):
+        cap = float(risk_cfg.get("max_single_weight_live", 0.60))
+        w = rm.cap_max_weight(w, max_weight=cap, eps=rm.config.eps)
+
+    return w

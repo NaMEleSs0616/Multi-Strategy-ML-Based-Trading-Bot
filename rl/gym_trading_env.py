@@ -10,7 +10,8 @@ Walk-forward evaluation uses :class:`PurgedWalkForwardSplitter` with embargo.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
 import gymnasium as gym
@@ -20,18 +21,74 @@ from gymnasium import spaces
 from rl.validation.purge import PurgedWalkForwardSplitter, WalkForwardFold, purge_indices
 
 
+# Canonical strategy-bank ordering. Downstream consumers (alpaca circuit
+# breaker, backtest column labels, paper-loop weight reports) MUST use this
+# constant or :func:`StrategyReturns.names` so the ordering stays single-source.
+STRATEGY_NAMES_3 = ("stat_arb", "vol_breakout", "mean_reversion")
+STRATEGY_NAMES_4 = ("stat_arb", "vol_breakout", "mean_reversion", "daily_momentum")
+
+
 @dataclass
 class StrategyReturns:
-    """Per-strategy simple returns aligned to the master timeline."""
+    """Per-strategy simple returns aligned to the master timeline.
+
+    The three "base" legs (``stat_arb``, ``vol_breakout``, ``mean_reversion``)
+    are required positional fields for backward compatibility. Optional
+    legs are appended in this canonical order:
+
+        1. ``daily_momentum`` (legacy 4th leg, kept as its own attribute
+           for code that constructs it explicitly).
+        2. Every entry in ``extra_legs`` in insertion order — this is how
+           new strategies (``daily_trend``, ``vix_fade``,
+           ``cross_sectional_mom``, …) are added without growing the
+           dataclass surface forever.
+
+    The matrix returned by :meth:`as_matrix` (and consumed by the gym env's
+    action space) is the stack of every active leg in :meth:`names` order,
+    so adding a leg to ``extra_legs`` automatically widens the PPO router's
+    action space.
+    """
 
     stat_arb: np.ndarray
     vol_breakout: np.ndarray
     mean_reversion: np.ndarray
+    daily_momentum: Optional[np.ndarray] = None
+    extra_legs: Optional[dict[str, np.ndarray]] = None
+
+    def _ordered_extra(self) -> list[tuple[str, np.ndarray]]:
+        if not self.extra_legs:
+            return []
+        # Insertion order is preserved for Python 3.7+ dicts.
+        return [(name, np.asarray(arr)) for name, arr in self.extra_legs.items()]
+
+    def names(self) -> tuple[str, ...]:
+        base: list[str] = list(STRATEGY_NAMES_3)
+        if self.daily_momentum is not None:
+            base.append("daily_momentum")
+        base.extend(name for name, _ in self._ordered_extra())
+        return tuple(base)
 
     def as_matrix(self) -> np.ndarray:
-        return np.stack(
-            [self.stat_arb, self.vol_breakout, self.mean_reversion],
-            axis=1,
+        legs: list[np.ndarray] = [self.stat_arb, self.vol_breakout, self.mean_reversion]
+        if self.daily_momentum is not None:
+            legs.append(self.daily_momentum)
+        legs.extend(arr for _, arr in self._ordered_extra())
+        return np.stack(legs, axis=1)
+
+    def slice(self, indices: np.ndarray) -> "StrategyReturns":
+        """Index-slice every leg by ``indices`` (preserves names/order)."""
+        idx = np.asarray(indices, dtype=np.int64)
+        extra = (
+            {name: arr[idx] for name, arr in self._ordered_extra()}
+            if self.extra_legs
+            else None
+        )
+        return StrategyReturns(
+            stat_arb=self.stat_arb[idx],
+            vol_breakout=self.vol_breakout[idx],
+            mean_reversion=self.mean_reversion[idx],
+            daily_momentum=(None if self.daily_momentum is None else self.daily_momentum[idx]),
+            extra_legs=extra,
         )
 
 
@@ -70,6 +127,13 @@ class TradingRoutingEnv(gym.Env):
         *,
         walk_forward_fold: Optional[WalkForwardFold] = None,
         turnover_penalty_lambda: float = 0.1,
+        turnover_penalty_multiplier: float = 1.0,
+        turnover_penalty_bps: Optional[float] = None,
+        turnover_weight_change_threshold: float = 0.05,
+        sortino_weight: float = 0.5,
+        outperformance_weight: float = 0.5,
+        sortino_window: int = 30,
+        sortino_eps: float = 1e-4,
         purge_embargo: int = 5,
         episode_length: Optional[int] = None,
         seed: Optional[int] = None,
@@ -91,7 +155,14 @@ class TradingRoutingEnv(gym.Env):
 
         self._embedding_dim = int(self._embeddings.shape[1])
         self._n_strategies = n_strategies
-        self.turnover_penalty_lambda = turnover_penalty_lambda
+        self.turnover_penalty_lambda = float(turnover_penalty_lambda)
+        self.turnover_penalty_multiplier = float(turnover_penalty_multiplier)
+        self.turnover_penalty_bps = None if turnover_penalty_bps is None else float(turnover_penalty_bps)
+        self.turnover_weight_change_threshold = float(turnover_weight_change_threshold)
+        self.sortino_weight = float(sortino_weight)
+        self.outperformance_weight = float(outperformance_weight)
+        self.sortino_window = int(max(5, sortino_window))
+        self.sortino_eps = float(sortino_eps)
         self.purge_embargo = purge_embargo
         self.episode_length = episode_length
 
@@ -120,6 +191,10 @@ class TradingRoutingEnv(gym.Env):
         self._cumulative_excess = 0.0
         self._excess_sq_sum = 0.0
         self._info_ratio_steps = 0
+
+        # Sortino rolling buffer (downside-only deviation, allows upside vol).
+        self._pf_window: deque[float] = deque(maxlen=self.sortino_window)
+
         self._settings = settings
 
     @staticmethod
@@ -197,6 +272,27 @@ class TradingRoutingEnv(gym.Env):
         std = float(np.sqrt(max(var, 1e-12)))
         return float(mean / std * np.sqrt(252.0))
 
+    def _rolling_sortino(self) -> float:
+        """
+        Rolling Sortino on the last ``sortino_window`` portfolio returns.
+
+        Downside deviation only — upside volatility is intentionally *not*
+        penalized, which is exactly the property the spec asks for so the
+        agent stops being terrified of green days.
+        """
+        n = len(self._pf_window)
+        if n < 2:
+            return 0.0
+        arr = np.fromiter(self._pf_window, dtype=np.float64, count=n)
+        mean = float(arr.mean())
+        downside = arr[arr < 0.0]
+        if downside.size < 2:
+            # No (or near-zero) downside: return mean / eps so the agent
+            # still gets a positive signal but bounded.
+            return float(mean / self.sortino_eps)
+        dn_std = float(downside.std(ddof=0))
+        return float(mean / max(dn_std, self.sortino_eps))
+
     def reset(
         self,
         *,
@@ -226,6 +322,7 @@ class TradingRoutingEnv(gym.Env):
         self._cumulative_excess = 0.0
         self._excess_sq_sum = 0.0
         self._info_ratio_steps = 0
+        self._pf_window.clear()
 
         index = int(self._active_indices[self._cursor])
         return self._obs_at(index), {
@@ -251,13 +348,48 @@ class TradingRoutingEnv(gym.Env):
                 self._settings,
                 bar_index=index,
             )
-        turnover = float(np.sum(np.abs(new_weights - self._weights)))
+        delta = np.abs(new_weights - self._weights)
+        turnover = float(np.sum(delta))
+        delta_mask = delta > float(self.turnover_weight_change_threshold)
+        turnover_thresholded = float(np.sum(delta[delta_mask]))
 
         leg_returns = self._strategy_matrix[index]
         portfolio_return = float(np.dot(new_weights, leg_returns))
         spy_return = float(self._spy[index])
         excess = portfolio_return - spy_return
-        reward = excess - self.turnover_penalty_lambda * turnover
+
+        # --- Asymmetric Sortino-style reward ------------------------------
+        # Spec:
+        # - Do NOT penalize upside variance.
+        # - Penalize only downside deviation relative to a 0% target.
+        # - Add a direct bonus when beating SPY on this step.
+        #
+        # We implement this *per-step* (not rolling) so OOS behavior stays
+        # responsive and doesn't freeze when the distribution shifts.
+        downside = max(0.0, -portfolio_return)  # deviation below 0 target
+        outperformance_bonus = max(0.0, excess)
+
+        # Turnover penalty:
+        # - Thresholded: only count per-leg |Δw| > 5% (default).
+        # - Expressed in bps of reallocated notional when provided via settings.
+        rl_cfg = (self._settings or {}).get("rl", {}) if self._settings is not None else {}
+        bps = self.turnover_penalty_bps
+        if bps is None:
+            bps = float(rl_cfg.get("turnover_penalty_bps", 0.0))
+        turnover_cost = float(bps) / 10_000.0 * turnover_thresholded
+
+        # Backward-compat: allow the older lambda-based penalty to remain,
+        # but make it additive and tiny by default via settings.
+        effective_lambda = self.turnover_penalty_lambda * self.turnover_penalty_multiplier
+        lambda_cost = effective_lambda * turnover_thresholded
+
+        reward = (
+            portfolio_return
+            - downside  # downside-only penalty (linear)
+            + outperformance_bonus
+            - turnover_cost
+            - lambda_cost
+        )
 
         self._weights = new_weights
         self._portfolio_returns.append(portfolio_return)
@@ -287,8 +419,16 @@ class TradingRoutingEnv(gym.Env):
             "spy_return": spy_return,
             "excess_return": excess,
             "turnover": turnover,
+            "turnover_thresholded": turnover_thresholded,
             "weights": new_weights.copy(),
             "information_ratio": self.current_information_ratio(),
+            "asym_downside": downside,
+            "outperformance_bonus": outperformance_bonus,
+            "turnover_penalty_bps": float(bps),
+            "turnover_weight_change_threshold": float(self.turnover_weight_change_threshold),
+            "turnover_cost": turnover_cost,
+            "effective_turnover_lambda": effective_lambda,
+            "lambda_cost": lambda_cost,
             "fold_id": None if self._fold is None else self._fold.fold_id,
             "purge_embargo": self.purge_embargo,
         }

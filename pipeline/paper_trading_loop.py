@@ -82,6 +82,23 @@ def run_paper_loop(
         weight_fn = equal_weight_fn(n_strategies)
 
     weights = weight_fn(t)
+
+    # Apply the intraday-latency circuit breaker BEFORE Kelly sizing.
+    # The Alpaca handler exposes ``filter_weights`` only when constructed in
+    # alpaca-paper mode without a live WS feed; in backtest/dry-run paths the
+    # filter is a no-op.
+    from adapters.execution.alpaca_execution import AlpacaExecutionHandler
+
+    if settings.get("execution", {}).get("mode") == "alpaca":
+        gate_handler = AlpacaExecutionHandler(
+            paper=bool(settings.get("execution", {}).get("paper", True)),
+            settings=settings,
+            websockets_connected=bool(
+                settings.get("execution", {}).get("websockets_connected", False)
+            ),
+        )
+        weights = gate_handler.filter_weights(weights)
+
     weights = apply_kelly_from_settings(weights, matrix, settings, bar_index=t)
     gross_exposure = float(np.clip(np.sum(np.abs(weights)), 0.0, 1.5))
 
@@ -138,15 +155,17 @@ def run_paper_loop(
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / "paper_loop_latest.json"
 
+    n_legs = int(np.asarray(weights).shape[0])
+    leg_names = data.strategy_returns.names()
+    if len(leg_names) != n_legs:
+        leg_names = tuple(f"leg_{i}" for i in range(n_legs))
+    weight_report = {name: float(weights[i]) for i, name in enumerate(leg_names)}
+
     payload = {
         "timestamp": ts.isoformat(),
         "dry_run": dry_run,
         "symbol": symbol.upper(),
-        "weights": {
-            "stat_arb": float(weights[0]),
-            "vol_breakout": float(weights[1]),
-            "mean_reversion": float(weights[2]),
-        },
+        "weights": weight_report,
         "gross_exposure": gross_exposure,
         "equity": handler.get_equity(),
         "orders_submitted": orders_submitted,
