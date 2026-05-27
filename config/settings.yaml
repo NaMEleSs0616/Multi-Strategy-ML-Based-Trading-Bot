@@ -1,0 +1,102 @@
+# Universe & data
+universe:
+  equities: [NVDA, AMD, META, GOOGL, MSFT]
+  etfs: [QQQ, SPY, XLK]
+
+data:
+  provider: yfinance  # yfinance | alpaca
+  sqlite_path: data/storage/market_data.db
+  daily_interval: 1d
+  intraday_intervals: [5m, 15m]
+  yfinance_period: 2y
+  intraday_period: 60d
+
+strategies:
+  pair: [NVDA, AMD]
+  dynamic_pair_selection: false
+  transaction_cost_bps: 5.0
+  stat_arb_z_window: 20
+  stat_arb_entry_z: 2.0
+  vol_atr_window: 14
+  vol_atr_mult: 1.5
+  vol_lookback: 20
+  mr_rsi_window: 14
+  mr_bb_window: 20
+
+# PiT feature engineering
+features:
+  frac_diff_d: 0.4
+  frac_diff_thresh: 0.001
+  autocorr_window: 20
+  atr_window: 14
+  pit_shift: 1  # mandatory shift for all rolling features
+  include_macro: false
+  include_sentiment: false
+
+# Stage 1: xLSTM encoder (self-supervised next-step MSE)
+xlstm:
+  hidden_dim: 128
+  num_blocks: 2
+  dropout: 0.1
+  sequence_length: 60
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  max_epochs: 100
+  val_fraction: 0.2
+  plateau_patience: 5
+  plateau_min_delta: 0.0001
+  checkpoint_dir: models/xlstm/checkpoints
+  export_embeddings: true
+  yfinance_period: 2y
+  synthetic_bars: 2500
+  ou_gamma: 0.1
+  ou_dt: 1.0
+
+# Stage 2: PPO capital router
+ppo:
+  total_timesteps: 20000
+  learning_rate: 0.0003
+  n_steps: 256
+  batch_size: 64
+  checkpoint_dir: models/ppo/checkpoints
+
+# Fractional Kelly risk overlay
+risk:
+  enabled: true
+  kelly_window: 30
+  kelly_fraction: 0.5
+
+# RL routing
+rl:
+  embedding_dim: 64
+  n_strategies: 3
+  turnover_penalty_lambda: 0.1
+  purge_embargo_bars: 5
+
+# Walk-forward validation
+walk_forward:
+  n_splits: 5
+  min_train_size: 252
+  test_size: 63
+  smoke_n_steps: 500
+
+# Execution
+execution:
+  mode: backtest  # backtest | alpaca
+  paper: true
+  order_type: limit
+  latency_bars: 1
+  spread_bps: 5.0
+  allow_market_orders: false
+
+# Backtest
+backtest:
+  initial_cash: 100000.0
+  rebalance_threshold: 0.05
+  report_dir: backtesting/reports
+
+# Diagnostics (dashboard / audit harness)
+diagnostics:
+  audit_n_bars: 120
+  audit_seed: 42

@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+data/storage/*.db
+!data/storage/.gitkeep
+.env
+models/xlstm/checkpoints/*.pt
+models/xlstm/checkpoints/*.npy
+models/xlstm/checkpoints/*.json
+models/ppo/checkpoints/
+backtesting/reports/

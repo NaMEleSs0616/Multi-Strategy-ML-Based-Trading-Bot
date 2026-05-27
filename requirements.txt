@@ -1,0 +1,23 @@
+# Core
+numpy>=1.26.0
+pandas>=2.2.0
+gymnasium>=0.29.0
+torch>=2.2.0
+
+# Data
+yfinance>=0.2.40
+alpaca-py>=0.28.0
+sqlalchemy>=2.0.0
+fredapi>=0.5.0
+sec-edgar-downloader>=5.0.0
+transformers>=4.40.0
+
+# Stats / ML (strategy bank & validation)
+scipy>=1.12.0
+statsmodels>=0.14.0
+stable-baselines3>=2.3.0
+
+# Config & tooling
+pyyaml>=6.0.0
+pytest>=8.0.0
+streamlit>=1.32.0

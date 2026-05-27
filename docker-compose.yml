@@ -1,0 +1,26 @@
+services:
+  dashboard:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./config:/app/config
+      - ./data/storage:/app/data/storage
+      - ./backtesting/reports:/app/backtesting/reports
+      - ./models:/app/models
+    environment:
+      SKIP_EDGAR_SENTIMENT: "1"
+      PYTHONPATH: /app
+    command: streamlit run frontend/app.py --server.address=0.0.0.0 --server.port=8501
+
+  dev:
+    build: .
+    volumes:
+      - .:/app
+    environment:
+      SKIP_EDGAR_SENTIMENT: "1"
+      PYTHONPATH: /app
+    working_dir: /app
+    command: bash
+    stdin_open: true
+    tty: true
