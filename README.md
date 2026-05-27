@@ -77,10 +77,11 @@ Multi-Strategy ML based trading bot/
 ├── strategies/                # Stat-arb, vol breakout, mean reversion, bank alignment
 ├── rl/                        # Gymnasium env, purged walk-forward splits
 ├── pipeline/
-│   ├── train_orchestrator.py  # 3-stage Global-to-Local training (PyTorch + asyncio)
-│   ├── training_data.py       # Embeddings + strategy bank tensors for RL
-│   ├── walk_forward_report.py # Purged OOS report
-│   └── paper_trading_loop.py  # Paper rebalance dry-run
+│   ├── train_orchestrator.py    # 3-stage Global-to-Local training (PyTorch + asyncio)
+│   ├── orchestrator_provider.py # SettingsFeatureProvider wired to adapters + strategy bank
+│   ├── training_data.py         # Embeddings + strategy bank tensors for RL
+│   ├── walk_forward_report.py   # Purged OOS report
+│   └── paper_trading_loop.py    # Paper rebalance dry-run
 ├── backtesting/               # Portfolio simulator, event-driven backtester, reports
 ├── execution/                 # Limit-order primitives (used by adapters)
 ├── frontend/                  # Streamlit control panel
@@ -155,6 +156,34 @@ Nothing in the default offline path requires paid APIs or live brokers.
 
 Sentiment (`features.include_sentiment: true`) uses SEC EDGAR + FinBERT and is slow; keep off unless you need it.
 
+### Alpaca paper trading setup
+
+Create a **Paper Trading** API key in the Alpaca dashboard, then export in your shell (never commit keys):
+
+```bash
+export APCA_API_KEY_ID="your_key_id"
+export APCA_API_SECRET_KEY="your_secret"
+export APCA_API_BASE_URL="https://paper-api.alpaca.markets"
+```
+
+Verify (prints booleans only):
+
+```bash
+python3 - <<'PY'
+import os
+print("KEY_ID set:", bool(os.getenv("APCA_API_KEY_ID")))
+print("SECRET set:", bool(os.getenv("APCA_API_SECRET_KEY")))
+PY
+```
+
+| Goal | `settings.yaml` |
+|------|-----------------|
+| Historical bars from Alpaca | `data.provider: alpaca` |
+| Paper limit orders | `execution.mode: alpaca`, `execution.paper: true` |
+| Offline training only | `data.provider: yfinance`, `execution.mode: backtest` (default) |
+
+Alpaca uses one key pair for both **Market Data API** (historical bars) and **Trading API** (limit orders). Live WebSocket ingest is not wired yet — use `scripts/sync_data.py` for bars.
+
 ## Quick start (offline)
 
 ### Path A — CLI scripts (stages 1–2)
@@ -188,9 +217,31 @@ python scripts/run_paper_loop.py
 # → http://localhost:8501
 ```
 
+**Note:** `train_xlstm.py` prints little during training; output appears at the end (`epochs=…`, `checkpoint=…`). Use `python3` (or activate `.venv`) — macOS often has no `python` command.
+
+### Recommended workflow after Stage 1
+
+Once xLSTM finishes (`xlstm_frozen.pt` exists):
+
+```bash
+python scripts/train_ppo.py              # Stage 2
+python scripts/run_backtest.py           # PPO-routed backtest
+python scripts/run_backtest.py --equal-weight   # baseline comparison
+python scripts/run_walk_forward_report.py
+python scripts/run_paper_loop.py --symbol SPY
+```
+
 ### Path B — Three-stage orchestrator (Global-to-Local)
 
-[`pipeline/train_orchestrator.py`](pipeline/train_orchestrator.py) runs Stages 1–3 in one call. It does **not** load data itself — implement `FeatureProvider` (numpy arrays only) and pass it in:
+Use the CLI (wired to [`pipeline/orchestrator_provider.py`](pipeline/orchestrator_provider.py)):
+
+```bash
+python scripts/sync_data.py
+python scripts/run_orchestrator.py -v
+python scripts/run_orchestrator.py --tickers NVDA AMD META --device mps
+```
+
+For custom data sources, implement `FeatureProvider` in [`pipeline/train_orchestrator.py`](pipeline/train_orchestrator.py) or extend `SettingsFeatureProvider`:
 
 ```python
 import asyncio
@@ -274,7 +325,23 @@ python scripts/run_orchestrator.py -v
 python scripts/run_orchestrator.py --tickers NVDA AMD --device mps
 ```
 
-Programmatic use (custom provider): import `pipeline.train_orchestrator` as shown in Path B below.
+### Long history and multiple stocks
+
+The repo trains **one global xLSTM** on a primary symbol, then **per-ticker Stage 3** policies — not a single pooled cross-sectional encoder yet.
+
+| Setting | Purpose |
+|---------|---------|
+| `data.yfinance_period: 5y` | ~5 years of daily bars (yfinance) |
+| `xlstm.yfinance_period: 5y` | Keep in sync with `data` |
+| `universe.equities: [...]` | All tickers for sync + Stage 3 fine-tune |
+| `walk_forward.min_train_size: 504` | ~2 years minimum train per fold (optional) |
+
+```bash
+python scripts/sync_data.py
+python scripts/run_orchestrator.py -v --global-symbol NVDA --tickers NVDA AMD META GOOGL MSFT
+```
+
+**Intraday limit:** yfinance caps 5m/15m history (~60 days). Daily features and stat-arb can use 5y; vol-breakout and mean-reversion legs use shorter intraday windows unless you add Alpaca historical or another source.
 
 Module smoke tests:
 
@@ -299,7 +366,8 @@ Returns are aligned to a master daily index in `strategies/bank.py` for RL and b
 |--------|--------|
 | `models/xlstm/cells.py` | sLSTM: log-space exponential gating + `c/n` readout; mLSTM: scalar gates, matrix memory `C`, normalizer `n`, retrieval `Cq / max(|n·q|, 1)` |
 | `models/xlstm/custom_loss.py` | L_total = L_MSE + γ·L_OU; smooth φ bound, innovation log-ratio, stationarity on φ_raw, mean-reversion θ on φ_raw, regime variance-growth term |
-| `models/xlstm/encoder.py` | `load_checkpoint(map_location=...)` moves the model onto the target device; `encode()` restores train/eval mode |
+| `models/xlstm/encoder.py` | `load_checkpoint(map_location=...)` pins model to device; backward-compat for older mLSTM checkpoints; `encode()` restores train/eval mode |
+| `models/xlstm/train.py` | Synthetic bars use a strictly-positive geometric random walk (`--no-yfinance`) |
 | `models/xlstm/dataset.py` | Causal windows: `x = features[t-L+1:t+1]`, `y = features[t+1]` (PiT-shifted upstream) |
 
 Forward passes are strictly autoregressive — no look-ahead in the cell unroll or dataset indexing.
@@ -338,6 +406,54 @@ docker compose up dashboard
 
 Phase 3 commands use SQLite and/or synthetic features; they do not open Alpaca WebSocket streams or place live orders.
 
+## Deployment (DigitalOcean / VPS)
+
+Minimal production layout: Ubuntu droplet + venv or Docker, scheduled sync/train jobs, optional Streamlit behind a firewall.
+
+**Suggested droplet:** 4–8 vCPU, 8–16 GB RAM, 80+ GB SSD.
+
+```bash
+# On droplet
+sudo apt update && sudo apt install -y git python3-venv python3-pip
+git clone https://github.com/NaMEleSs0616/Multi-Strategy-ML-Based-Trading-Bot.git
+cd Multi-Strategy-ML-Based-Trading-Bot
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+export PYTHONPATH=.
+export SKIP_EDGAR_SENTIMENT=1
+# Set APCA_* env vars here for paper trading
+
+python scripts/sync_data.py
+python scripts/train_xlstm.py
+python scripts/train_ppo.py
+```
+
+**Docker dashboard:**
+
+```bash
+docker compose up -d dashboard   # http://<host>:8501 — restrict with UFW to your IP
+```
+
+**Cron example** (daily sync, weekly retrain):
+
+```cron
+0 6 * * * cd /path/to/repo && .venv/bin/python scripts/sync_data.py >> logs/sync.log 2>&1
+0 2 * * 0 cd /path/to/repo && .venv/bin/python scripts/train_xlstm.py >> logs/xlstm.log 2>&1
+```
+
+Back up `data/storage/market_data.db`, `models/xlstm/checkpoints/`, `models/ppo/checkpoints/`, and `backtesting/reports/`.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `command not found: python` | Use `python3` or `source .venv/bin/activate` then `python` |
+| `train_xlstm.py` shows no output | Normal — wait for final `epochs=…` line; training can take minutes on CPU |
+| `RuntimeError` loading xLSTM checkpoint (mLSTM shape mismatch) | Retrain: `python scripts/train_xlstm.py` — or pull latest (encoder loads old checkpoints with conversion) |
+| `invalid value encountered in log` with `--no-yfinance` | Fixed in latest `train.py` (positive synthetic prices); pull latest or retrain |
+| Paper loop fails without PPO | Use `--equal-weight`, or run `train_ppo.py` first |
+| yfinance 403 / download errors | Use cached SQLite from `sync_data.py`; check network/proxy |
+
 ## Testing
 
 ```bash
@@ -356,6 +472,8 @@ Coverage highlights: fracdiff, adapters, Kelly, OU loss (`tests/test_custom_loss
 - [`rl/gym_trading_env.py`](rl/gym_trading_env.py) — PPO routing environment, cost-aware reward, purged walk-forward splits
 - [`models/xlstm/`](models/xlstm/) — sLSTM + mLSTM blocks, OU-informed pretraining, freeze for RL
 - [`pipeline/train_orchestrator.py`](pipeline/train_orchestrator.py) — Global-to-Local three-stage training + async Stage 3 queue
+- [`pipeline/orchestrator_provider.py`](pipeline/orchestrator_provider.py) — `SettingsFeatureProvider` for `run_orchestrator.py`
+- [`scripts/run_orchestrator.py`](scripts/run_orchestrator.py) — CLI for full Global-to-Local pipeline
 
 ## Not implemented / requires keys
 
