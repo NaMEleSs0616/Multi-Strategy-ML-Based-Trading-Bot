@@ -75,7 +75,12 @@ def cross_sectional_momentum_returns(
         idx = pd.DatetimeIndex(s.index)
         if idx.tz is not None:
             idx = idx.tz_localize(None)
-        return pd.Series(s.values, index=idx.normalize())
+        out = pd.Series(s.values, index=idx.normalize())
+        # Mixed caches can produce duplicate labels for the same calendar day.
+        # Keep the last close for that day to preserve canonical daily ROC.
+        if out.index.has_duplicates:
+            out = out.groupby(out.index).last()
+        return out.sort_index()
 
     ticker_close = _daily_close(ticker_bars).reindex(out_index).ffill()
     spy_close = _daily_close(benchmark_bars).reindex(out_index).ffill()

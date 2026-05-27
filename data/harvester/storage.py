@@ -115,7 +115,19 @@ class BarStore:
         if frame.empty:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
-        frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+        # Stored timestamps may now include explicit timezone offsets
+        # (e.g. 2026-05-27T09:30:00-04:00) from Alpaca intraday syncs.
+        # Parse as ISO8601 + UTC to handle mixed offset/naive strings safely.
+        frame["timestamp"] = pd.to_datetime(
+            frame["timestamp"],
+            format="ISO8601",
+            utc=True,
+            errors="coerce",
+        )
+        # Drop malformed timestamps defensively instead of crashing the pipeline.
+        frame = frame.dropna(subset=["timestamp"])
+        # Downstream code expects a plain DatetimeIndex.
+        frame["timestamp"] = frame["timestamp"].dt.tz_convert(None)
         frame = frame.set_index("timestamp")
         return frame.astype(float)
 

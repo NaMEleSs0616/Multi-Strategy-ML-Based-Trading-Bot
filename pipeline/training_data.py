@@ -26,24 +26,52 @@ class TrainingData:
     features: np.ndarray
 
 
+def _normalize_daily_index(
+    idx: pd.DatetimeIndex,
+    *,
+    tz: str = "America/New_York",
+    dedupe: bool = False,
+) -> pd.DatetimeIndex:
+    """
+    Normalize index to timezone-naive daily stamps for robust joins.
+
+    Feature frames may arrive tz-aware (Alpaca) while strategy-bank indices are
+    often tz-naive. We convert aware indices to a common market timezone before
+    dropping tz, then normalize to calendar day.
+    """
+    out = pd.DatetimeIndex(idx)
+    if out.tz is not None:
+        out = out.tz_convert(tz)
+        out = out.tz_localize(None)
+    out = out.normalize()
+    if dedupe and out.has_duplicates:
+        out = pd.DatetimeIndex(out[~out.duplicated(keep="last")])
+    return out
+
+
 def align_to_feature_index(
     bundle: MarketBundle,
     features: np.ndarray,
     feat_index: pd.DatetimeIndex,
     embeddings: np.ndarray,
 ) -> TrainingData:
-    master = pd.DatetimeIndex(bundle.master_index).normalize()
-    feat_index = pd.DatetimeIndex(feat_index).normalize()
+    master = _normalize_daily_index(pd.DatetimeIndex(bundle.master_index), dedupe=True)
+    feat_index = _normalize_daily_index(pd.DatetimeIndex(feat_index), dedupe=False)
 
     if len(features) != len(feat_index) or len(embeddings) != len(features):
         raise ValueError("features, index, and embeddings must have equal length")
 
+    # Fast date-map join; resilient to index metadata drift.
+    master_lookup: dict[pd.Timestamp, int] = {}
+    for i, ts in enumerate(master):
+        master_lookup[ts] = i
+
     master_rows: list[int] = []
     feat_rows: list[int] = []
     for i, ts in enumerate(feat_index):
-        loc = master.get_indexer([ts], method=None)
-        if loc[0] >= 0:
-            master_rows.append(int(loc[0]))
+        loc = master_lookup.get(ts)
+        if loc is not None:
+            master_rows.append(loc)
             feat_rows.append(i)
 
     if len(feat_rows) < 64:

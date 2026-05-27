@@ -73,6 +73,34 @@ def _daily_close_series(bars: pd.DataFrame) -> pd.Series:
     return daily
 
 
+def _dedupe_daily_bars(bars: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure one OHLCV row per normalized day.
+
+    Mixed historical backfills (legacy naive timestamps + newer tz-aware
+    timestamps) can leave multiple rows that collapse to the same calendar
+    day after ``normalize()``. This causes non-unique master indices and
+    breaks downstream alignment. We aggregate to canonical daily OHLCV.
+    """
+    if bars.empty:
+        return bars
+    frame = bars.copy()
+    idx = pd.to_datetime(frame.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    frame.index = idx.normalize()
+    agg = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }
+    keep = {k: v for k, v in agg.items() if k in frame.columns}
+    out = frame.groupby(frame.index).agg(keep).sort_index()
+    return out.astype(float, copy=False)
+
+
 def build_strategy_bank(
     settings: Optional[dict[str, Any]] = None,
     *,
@@ -112,10 +140,14 @@ def build_strategy_bank(
     primary_daily = _load_bars(store, primary, daily_iv, settings)
     if primary_daily.empty:
         raise RuntimeError(f"No daily bars for {primary}. Run: python scripts/sync_data.py")
+    if daily_iv in {"1d", "1wk"}:
+        primary_daily = _dedupe_daily_bars(primary_daily)
 
     master_index = pd.to_datetime(primary_daily.index).normalize()
     if master_index.tz is not None:
         master_index = master_index.tz_localize(None)
+    # Guardrail against non-unique dates from heterogeneous cached timestamps.
+    master_index = pd.DatetimeIndex(master_index[~master_index.duplicated(keep="last")])
 
     # --- Stat arb (daily) ---
     pair = tuple(str(s) for s in strat_cfg.get("pair", ["NVDA", "AMD"]))
