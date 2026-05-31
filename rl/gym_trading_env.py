@@ -356,18 +356,17 @@ class TradingRoutingEnv(gym.Env):
         leg_returns = self._strategy_matrix[index]
         portfolio_return = float(np.dot(new_weights, leg_returns))
         spy_return = float(self._spy[index])
-        excess = portfolio_return - spy_return
+        alpha = portfolio_return - spy_return
 
-        # --- Asymmetric Sortino-style reward ------------------------------
-        # Spec:
-        # - Do NOT penalize upside variance.
-        # - Penalize only downside deviation relative to a 0% target.
-        # - Add a direct bonus when beating SPY on this step.
-        #
-        # We implement this *per-step* (not rolling) so OOS behavior stays
-        # responsive and doesn't freeze when the distribution shifts.
-        downside = max(0.0, -portfolio_return)  # deviation below 0 target
-        outperformance_bonus = max(0.0, excess)
+        # --- Composite reward (settings: sortino_weight + outperformance_weight) ---
+        # Per-step Sortino proxy: full credit on green days; amplified loss on red days.
+        # Alpha is signed (R_p - R_SPY), not clipped, so underperformance is penalized.
+        if portfolio_return >= 0.0:
+            sortino_step = portfolio_return
+        else:
+            sortino_step = portfolio_return * (1.0 + self.sortino_weight)
+        sortino_component = self.sortino_weight * sortino_step
+        outperformance_component = self.outperformance_weight * alpha
 
         # Turnover penalty:
         # - Thresholded: only count per-leg |Δw| > 5% (default).
@@ -384,17 +383,16 @@ class TradingRoutingEnv(gym.Env):
         lambda_cost = effective_lambda * turnover_thresholded
 
         reward = (
-            portfolio_return
-            - downside  # downside-only penalty (linear)
-            + outperformance_bonus
+            sortino_component
+            + outperformance_component
             - turnover_cost
             - lambda_cost
         )
 
         self._weights = new_weights
         self._portfolio_returns.append(portfolio_return)
-        self._excess_returns.append(excess)
-        self._information_ratio_component(excess)
+        self._excess_returns.append(alpha)
+        self._information_ratio_component(alpha)
 
         self._cursor += 1
         self._step_in_episode += 1
@@ -417,13 +415,16 @@ class TradingRoutingEnv(gym.Env):
             "next_bar_index": next_index,
             "portfolio_return": portfolio_return,
             "spy_return": spy_return,
-            "excess_return": excess,
+            "excess_return": alpha,
+            "alpha": alpha,
             "turnover": turnover,
             "turnover_thresholded": turnover_thresholded,
             "weights": new_weights.copy(),
             "information_ratio": self.current_information_ratio(),
-            "asym_downside": downside,
-            "outperformance_bonus": outperformance_bonus,
+            "sortino_step": sortino_step,
+            "sortino_component": sortino_component,
+            "outperformance_component": outperformance_component,
+            "asym_downside": max(0.0, sortino_step - portfolio_return),
             "turnover_penalty_bps": float(bps),
             "turnover_weight_change_threshold": float(self.turnover_weight_change_threshold),
             "turnover_cost": turnover_cost,
